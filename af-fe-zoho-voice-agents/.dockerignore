@@ -1,0 +1,30 @@
+# Ignore node_modules - it will be reinstalled in the container
+node_modules
+ 
+# Ignore log files
+*.log
+ 
+# Ignore the dist directory - the code will be compiled inside the container
+dist
+ 
+# Ignore sensitive environment variables
+.env
+ 
+# Ignore version control directories
+.git
+ 
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+ 
+# Ignore test files
+/test/
+*.spec.js
+ 
+# Ignore Docker-related files
+Dockerfile*
+.dockerignore
+ 
+npm-debug.log*
+README.md
+.next

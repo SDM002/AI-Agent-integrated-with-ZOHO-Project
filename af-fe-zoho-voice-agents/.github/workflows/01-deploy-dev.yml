@@ -1,0 +1,229 @@
+name: 01-deploy-dev (ACA)
+
+on:
+  push:
+    branches: ["dev"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: aca-dev-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================
+  # BUILD + SCAN + PUSH
+  # ============================
+  build:
+    runs-on: ubuntu-latest
+    environment: dev
+
+    outputs:
+      IMAGE: ${{ steps.img.outputs.IMAGE }}
+      LOGIN_SERVER: ${{ steps.acr.outputs.LOGIN_SERVER }}
+
+    steps:
+      - name: Clean workspace
+        run: |
+          echo "Cleaning workspace..."
+          rm -rf * .[^.]* || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Compute image tag
+        id: meta
+        run: echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Get ACR login server
+        id: acr
+        run: |
+          LOGIN_SERVER=$(az acr show \
+            -g "${{ vars.RG_SHARED }}" \
+            -n "${{ vars.ACR_NAME }}" \
+            --query loginServer -o tsv)
+          echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_OUTPUT
+
+      - name: Define image
+        id: img
+        run: |
+          echo "IMAGE=${{ steps.acr.outputs.LOGIN_SERVER }}/${{ vars.ACR_REPO }}:${{ steps.meta.outputs.TAG }}" >> $GITHUB_OUTPUT
+
+      - name: ACR Login
+        run: az acr login -n "${{ vars.ACR_NAME }}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          no-cache: true
+          tags: ${{ steps.img.outputs.IMAGE }}
+          cache-from: type=gha,scope=dev
+          cache-to: type=gha,mode=max,scope=dev
+
+      # ----------------------------
+      # Trivy Scan (SECURE VERSION)
+      # ----------------------------
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@ff1b8b060f23b650436d419b5e13f67f5d4c3087
+
+      - name: Trivy Scan Image
+        run: |
+          trivy image \
+            --severity CRITICAL,HIGH \
+            --exit-code 0 \
+            --ignore-unfixed \
+            --format table \
+            --output trivy-image-report.txt \
+            ${{ steps.img.outputs.IMAGE }}
+
+      - name: Show Trivy Report
+        if: always()
+        run: |
+          echo "========== TRIVY IMAGE SCAN REPORT =========="
+          if [ -f trivy-image-report.txt ]; then
+            cat trivy-image-report.txt
+          else
+            echo "No report file found."
+          fi
+
+      - name: Push image to ACR
+        run: docker push "${{ steps.img.outputs.IMAGE }}"
+
+  # ============================
+  # DEPLOY JOB
+  # ============================
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    needs: build
+
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure Container App exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if az containerapp show -g "${{ vars.RG_ENV }}" -n "${{ vars.APP_NAME }}" >/dev/null 2>&1; then
+            echo "Container App exists"
+          else
+            az containerapp create \
+              -g "${{ vars.RG_ENV }}" \
+              -n "${{ vars.APP_NAME }}" \
+              --environment "${{ vars.CAE_ENV }}" \
+              --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
+              --ingress "${{ vars.INGRESS_TYPE }}" \
+              --target-port 80 \
+              --transport auto \
+              --min-replicas 1 \
+              --max-replicas 2 \
+              --system-assigned
+          fi
+
+      - name: Verify AcrPull role for Container App
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PRINCIPAL_ID=$(az containerapp show \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.APP_NAME }}" \
+            --query identity.principalId \
+            -o tsv)
+
+          if [[ -z "$PRINCIPAL_ID" ]]; then
+            echo "❌ Container App has no system-assigned identity"
+            exit 1
+          fi
+
+          ACR_ID=$(az acr show \
+            -g "${{ vars.RG_SHARED }}" \
+            -n "${{ vars.ACR_NAME }}" \
+            --query id \
+            -o tsv)
+
+          ROLE_COUNT=$(az role assignment list \
+            --assignee "$PRINCIPAL_ID" \
+            --scope "$ACR_ID" \
+            --role AcrPull \
+            --query "length(@)" \
+            -o tsv)
+
+          if [[ "$ROLE_COUNT" -eq 0 ]]; then
+            echo "❌ AcrPull role is NOT assigned"
+            exit 1
+          fi
+
+          echo "✅ AcrPull role verified"
+
+      - name: Verify ingress target port
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT_PORT=$(az containerapp show \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.APP_NAME }}" \
+            --query "properties.configuration.ingress.targetPort" \
+            -o tsv)
+
+          DESIRED_PORT="${{ vars.APP_PORT }}"
+
+          if [[ "$CURRENT_PORT" != "$DESIRED_PORT" ]]; then
+            az containerapp ingress update \
+              -g "${{ vars.RG_ENV }}" \
+              -n "${{ vars.APP_NAME }}" \
+              --target-port "$DESIRED_PORT"
+          fi
+
+      - name: Configure ACR registry (system identity)
+        shell: bash
+        run: |
+          az containerapp registry set \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.APP_NAME }}" \
+            --server "${{ needs.build.outputs.LOGIN_SERVER }}" \
+            --identity system
+
+      - name: Deploy image
+        shell: bash
+        run: |
+          az containerapp update \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.APP_NAME }}" \
+            --image "${{ needs.build.outputs.IMAGE }}"
+
+      - name: Show app status
+        shell: bash
+        run: |
+          az containerapp show \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.APP_NAME }}" \
+            --query "{state:properties.provisioningState,fqdn:properties.configuration.ingress.fqdn,revision:properties.latestReadyRevisionName}" \
+            -o table
